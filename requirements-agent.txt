@@ -1,0 +1,3 @@
+# Optional: the self-check agent (agent.py). Not installed in production; see README "Self-check agent".
+-r requirements.txt
+langgraph

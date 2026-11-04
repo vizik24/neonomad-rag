@@ -1,0 +1,11 @@
+# Only what the API and a one-off ingest need goes into the image (the Dockerfile copies files explicitly).
+.venv/
+.env
+__pycache__/
+.claude/
+.DS_Store
+docs/html/
+docs/pdf/
+eval/
+scripts/
+smoke_test.log

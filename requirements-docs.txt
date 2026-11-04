@@ -1,0 +1,4 @@
+# Offline only: regenerating docs/md from the saved HTML and PDFs (docs/convert_*.py). Not in the production image.
+beautifulsoup4
+markdownify
+pymupdf4llm

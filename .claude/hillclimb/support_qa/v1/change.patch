@@ -1,0 +1,20 @@
+--- a/query.py
++++ b/query.py
+@@ -57,9 +57,16 @@
+ - A simple question needs one query (usually the question itself).
+ - A question that depends on two topics (e.g. a product detail and a DVLA rule) needs one query per topic, \
+ each phrased the way the relevant document would talk about it.
+-- Never more than 3 queries."""
++- Never more than 3 queries.
+ 
++Write each query about its topic only:
++- Leave out the company name "Neo Nomad": every document mentions it, so it pulls results towards generic \
++company pages.
++- Name a product (BikerBed, kitchen, mattress) only when the query is about that product's own features. For \
++policy topics, name the policy instead: "warranty cover for damage during installation", not "BikerBed \
++warranty"."""
+ 
++
+ class SearchPlan(BaseModel):
+     queries: list[str] = Field(description="1-3 search queries, each about one topic.")
+ 

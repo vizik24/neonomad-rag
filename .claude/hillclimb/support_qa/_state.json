@@ -1,0 +1,60 @@
+{
+  "flow": "support_qa",
+  "metrics": [
+    {
+      "id": "pass",
+      "label": "Pass",
+      "kind": "binary"
+    },
+    {
+      "id": "answerable_ok",
+      "label": "Answerable ok",
+      "kind": "binary"
+    },
+    {
+      "id": "facts",
+      "label": "Key facts",
+      "kind": "continuous"
+    },
+    {
+      "id": "no_violation",
+      "label": "No violation",
+      "kind": "binary"
+    },
+    {
+      "id": "grounded",
+      "label": "Grounded",
+      "kind": "binary"
+    },
+    {
+      "id": "citations_ok",
+      "label": "Citations ok",
+      "kind": "binary"
+    },
+    {
+      "id": "retrieval_hit",
+      "label": "Retrieval hit",
+      "kind": "binary"
+    }
+  ],
+  "perf_fields": [
+    "latency_s",
+    "cost_usd",
+    "n_queries",
+    "n_chunks"
+  ],
+  "prices": {
+    "claude-opus-5-5": {
+      "in": 4.0,
+      "out": 20.0
+    },
+    "claude-sonnet-5-5": {
+      "in": 2.0,
+      "out": 10.0
+    }
+  },
+  "harness_paths": [
+    "eval/run_eval.py",
+    "eval/cases.jsonl"
+  ]
+}

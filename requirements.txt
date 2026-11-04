@@ -1,0 +1,14 @@
+# Ingestion
+sentence-transformers
+psycopg[binary]
+pgvector
+
+# Query
+anthropic
+pydantic
+python-dotenv
+
+# API (app.py)
+fastapi
+uvicorn
+psycopg-pool
