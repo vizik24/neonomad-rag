@@ -437,77 +437,83 @@ Two of the pilot's "retrieval misses" were **my case errors**: the right fact ca
 - **Judge not yet calibrated against human labels.** The checks above test known-good and known-bad answers. A proper calibration would compare the judge with independent human grades on ~30 answers.
 - **Cost of the judge.** 45% of the $0.026 per answer ($1.03 of $2.31) is the Sonnet judge.
 
-## Deployment (AWS ECS)
+## Deployment (AWS Lambda + Supabase)
 
-`app.py` puts `query.py`'s pipeline behind a small FastAPI service, and the `Dockerfile` packages it for ECS on Fargate.
+Live on a Lambda Function URL (`POST /ask`, `GET /health`). The URL isn't published here; `aws lambda get-function-url-config --function-name neonomad-support` prints it.
+
+`app.py` puts `query.py`'s pipeline behind a small FastAPI service. The `Dockerfile` packages it as one image that runs on AWS Lambda through the Lambda Web Adapter, or as a plain container anywhere else.
 
 ```
-neonomad.co.uk ──HTTPS──► load balancer ──► ECS Fargate task (app.py) ──► RDS Postgres + pgvector
-                                                 │
-                                                 ├──► Anthropic API
-                                                 └──► CloudWatch Logs     (secrets from Secrets Manager)
+neonomad.co.uk ──HTTPS──► Lambda Function URL ──► Lambda (app.py, container image from ECR)
+                                                     │
+                                                     ├──► Supabase Postgres + pgvector  (chunks, rate limits)
+                                                     ├──► Anthropic API
+                                                     └──► CloudWatch Logs
 ```
+
+**Running cost: close to zero.** Lambda and its Function URL are in AWS's always-free tier (1M requests and 400,000 GB-seconds a month; one question uses ~15 GB-seconds at 3 GB, so ~25,000 questions a month are free). ECR keeps the last 3 images (~$0.10/month). The database is the Neo Nomad Supabase project the website already uses, on its free plan. Anthropic is the only real cost: ~1–3p per question, capped by the rate limits below.
 
 **API**
 
 ```bash
-curl -s https://<host>/ask -H 'content-type: application/json' -d '{"question": "Do you deliver to France?"}'
+curl -s https://<function-url>/ask -H 'content-type: application/json' -d '{"question": "Do you deliver to France?"}'
 # {"answerable": true, "answer": "...", "sources": [{"id": "faq:1", "title": "...", "heading": "...", "url": "..."}]}
-curl -s https://<host>/health     # {"status": "ok", "chunks": 88}, or 503 if the database is down or empty
+curl -s https://<function-url>/health     # {"status": "ok", "chunks": 88}, or 503 if the database is down or empty
 ```
 
 Run it locally with `.venv/bin/uvicorn app:app --port 8000`.
 
 ### 14. Production service and image
 
+- **Lambda, not ECS, because of cost.** ECS on Fargate needs a load balancer for HTTPS (~$20/month) plus the task and a database: ~$75–90/month at minimum. Lambda's Function URL gives HTTPS for free, and Lambda only runs while answering. The same image still runs on ECS; `deploy/ecs-task-definition.json` is kept as a template if traffic ever justifies it.
+- **Supabase, not RDS.** The website already has a Supabase project, its free plan includes pgvector, and it avoids a second database to pay for and run. The assistant's tables sit beside the site's (`chunks`, `rate_limit_events`); names were checked for clashes before ingesting. pgvector is enabled in Supabase's `extensions` schema, as Supabase recommends.
+- **Row-level security on both tables.** Supabase exposes `public` tables through its REST API with the site's public key. RLS with no policies blocks that; the app connects as the table owner, which RLS doesn't apply to.
+- **Connects through Supabase's session pooler**, because the direct database address is IPv6-only and Lambda isn't. Prepared statements are turned off (`prepare_threshold=None`), so transaction-mode pooling works too.
+- **Lambda Web Adapter.** A Lambda extension copied into the image turns each invocation into an HTTP request to uvicorn, so the FastAPI app needs no Lambda-specific code. Its readiness check uses `/ready`, not `/health`: `/health` returns 503 until the database is ingested, which would stop the function ever starting.
 - **Plain pipeline only.** The service calls `query.py`. `agent.py` isn't copied into the image and `langgraph` isn't installed, so the 2–5× self-check cost can't reach production by accident. The conversion libraries (pymupdf etc.) are left out the same way, in `requirements-docs.txt`.
-- **One image, two jobs.** The image holds `ingest.py` and `docs/md` too, so filling the production database is a one-off ECS task with the command overridden (below). There's no separate ingestion setup.
-- **Model baked in.** The Dockerfile downloads bge-small at build time and sets `HF_HUB_OFFLINE=1`. Containers start without reaching Hugging Face, and every task runs exactly the same model as ingestion.
-- **CPU-only torch.** The default torch wheel bundles CUDA, several GB that Fargate can't use. Even so, the image is 2.2 GB, ~700 MB of it torch. Moving the query embedding to ONNX would remove torch entirely; that's the next size win if cold starts matter.
-- **ARM64 (Graviton).** It's about 20% cheaper on Fargate than x86, and a Mac builds it natively. Building on x86 CI needs `docker buildx build --platform linux/arm64`.
-- **One worker per task.** Each worker loads its own copy of the model, so the service scales by adding ECS tasks, not workers. The endpoint is a sync function: FastAPI runs it in a thread, which suits the blocking model, database and API calls.
-- **Connection pool** (`psycopg-pool`, 1–4 connections) checks each connection before use, so an RDS restart or failover doesn't leave dead connections behind.
-- **Health check means "can answer".** `/health` checks the database is reachable *and* the chunks table isn't empty. A task pointed at an un-ingested database fails its health check instead of telling every customer "I don't know".
+- **Model baked in.** The Dockerfile downloads bge-small at build time and sets `HF_HUB_OFFLINE=1`: no download at startup, and production runs exactly the model ingestion used. Tested with a read-only filesystem, as Lambda runs it.
+- **CPU-only torch, ARM64.** The default torch wheel bundles CUDA, several GB Lambda can't use. ARM is cheaper per GB-second and builds natively on a Mac.
+- **Cold starts: 8–10 s at 3008 MB.** Startup is mostly importing torch and loading the model. At 2048 MB it took ~19 s and overran Lambda's 10 s init limit; Lambda CPU scales with memory, and 3008 MB is this account's maximum. Warm requests add ~0.1 s. The next improvement is ONNX instead of torch for the query embedding, which would shrink the 2.2 GB image and the import time.
+- **Health check means "can answer".** `/health` checks the database is reachable *and* the chunks table isn't empty.
 - **Logs hold metadata, not questions.** Each answer logs answerable, query and chunk counts, tokens, invalid citations and latency. Customer questions can contain names, addresses or order details, so the text isn't logged.
-- **Cost and abuse limits in code.** Questions are capped at 500 characters. CORS allows only the origins in `ALLOWED_ORIGINS`. Anthropic and database failures return a 502/503 that points to the support email, not a stack trace.
-- **Rate limiting in the app (`ratelimit.py`), free, no extra infrastructure.** Three sliding-window limits, checked before any Claude call, so a rejected request costs nothing:
+- **Limits in code.** Questions are capped at 500 characters. CORS allows only the origins in `ALLOWED_ORIGINS` (neonomad.co.uk). There's no `/docs` or `/openapi.json` on the public API. Anthropic and database failures return a 502/503 that points to the support email, not a stack trace.
+- **Rate limiting in Postgres (`ratelimit.py`), free, shared by every Lambda instance.** In-memory counts wouldn't work on Lambda: each concurrent request can be a separate, short-lived instance. Three sliding-window limits, checked before any Claude call, so a rejected request costs nothing:
 
   | Limit | Default | Env var | Stops |
   |---|---|---|---|
   | Per IP, per minute | 5 | `RATE_LIMIT_PER_MINUTE` | One script hammering the endpoint |
   | Per IP, per day | 30 | `RATE_LIMIT_PER_DAY` | One person or script grinding slowly all day |
-  | All questions, per day | 300 | `DAILY_QUESTION_LIMIT` | A script rotating through many IPs: **this is what caps the bill**, at roughly $3–9/day per task |
+  | All questions, per day | 300 | `DAILY_QUESTION_LIMIT` | A script rotating through many IPs: **this is what caps the bill**, at roughly $3–9/day |
 
-  Over a limit → `429` with `Retry-After` and a message pointing to support. The client IP is the **last** `X-Forwarded-For` entry, the one the load balancer appends. Earlier entries come from the client and can be faked, so tasks must accept traffic only from the load balancer's security group. Limitations: counts are kept **per task** in memory (2 tasks = 2× the limits) and reset when a task restarts. Sharing them across tasks would need Redis, and AWS WAF is the stronger option if traffic grows. Rejected IPs aren't logged, only the count.
+  Over a limit → `429` with `Retry-After` and a message pointing to support. Only allowed questions are recorded, as a **sha256 hash of the IP** (never the address), and rows older than a day are deleted, so the table holds at most a day's questions. An advisory lock serialises checks, so two instances can't both take the last slot. If the check itself fails, the request is refused (503), never answered unchecked. The client IP comes from Lambda's request context (`sourceIp`), which the client can't fake; behind a load balancer it falls back to the last `X-Forwarded-For` entry.
 
 ### Deploying
 
-Placeholders are in `<ANGLE_BRACKETS>`. The task definition template is `deploy/ecs-task-definition.json`.
+The live setup, in `eu-north-1` (Stockholm: this AWS account's organisation policies don't allow London):
 
-1. **Database:** create an RDS for PostgreSQL 17 instance (pgvector is supported; `ingest.py` runs `CREATE EXTENSION vector` itself). Put it in the same VPC, with a security group that allows port 5432 from the ECS tasks' security group only.
-2. **Secrets:** in Secrets Manager, store `ANTHROPIC_API_KEY` and `DATABASE_URL` (`postgresql://<user>:<password>@<rds-endpoint>:5432/<db>?sslmode=require`). The task execution role needs `secretsmanager:GetSecretValue` on both, plus `logs:CreateLogGroup` for the log group.
-3. **Image:**
+1. **Database.** Supabase → Connect → **Session pooler** connection string, in `.env` as `SUPABASE_DATABASE_URL`. Load the knowledge base (and again whenever `docs/md` changes):
    ```bash
-   aws ecr create-repository --repository-name neonomad-support
-   aws ecr get-login-password --region <REGION> | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com
-   docker build -t <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/neonomad-support:<TAG> .
-   docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/neonomad-support:<TAG>
+   DATABASE_URL="$(grep ^SUPABASE_DATABASE_URL= .env | cut -d= -f2-)" .venv/bin/python ingest.py
    ```
-4. **Task definition:** fill in the placeholders, then `aws ecs register-task-definition --cli-input-json file://deploy/ecs-task-definition.json`.
-5. **Ingest:** run the same task once with the command overridden (and again whenever `docs/md` changes, after rebuilding the image):
-   ```bash
-   aws ecs run-task --cluster <CLUSTER> --launch-type FARGATE --task-definition neonomad-support \
-     --network-configuration 'awsvpcConfiguration={subnets=[<SUBNET>],securityGroups=[<TASK_SG>]}' \
-     --overrides '{"containerOverrides":[{"name":"support-api","command":["python","ingest.py"]}]}'
-   ```
-6. **Service:** create an ECS service behind an Application Load Balancer with HTTPS, target port 8000 and health check path `/health`.
+2. **Image repository:** `aws ecr create-repository --repository-name neonomad-support`, with a lifecycle policy keeping the last 3 images.
+3. **Execution role** `neonomad-support-lambda`: trusted by `lambda.amazonaws.com`, with only `AWSLambdaBasicExecutionRole` (its own logs).
+4. **Function** `neonomad-support`: package type Image, `arm64`, 3008 MB, 60 s timeout. Environment: `ANTHROPIC_API_KEY`, `DATABASE_URL` (the pooler string), `ALLOWED_ORIGINS`, and the three rate limits. Lambda encrypts environment variables at rest.
+5. **Function URL** with auth type `NONE`, plus resource-policy permissions for `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction` (via function URL) for `*`.
 
-**Before it goes on the live site** (not built yet):
-- **A spend limit in the Anthropic console.** In-app rate limiting caps normal abuse, but a monthly cap is the backstop for everything else (e.g. more tasks than planned).
-- **The chat widget** on neonomad.co.uk that calls `/ask`.
-- **AI disclosure** in that widget: tell customers they're talking to an automated assistant.
+**Updating the code** after that is one command. It builds the image in the format Lambda accepts, pushes it and points the function at it:
 
-**Tested locally:** the rate limiter (each limit, IP handling and memory, with a fake clock), a real `429` through the API with no Claude call behind it, the API (health, validation, one answer) and the built image (health, an answer, a 503 with a wrong database password, the Docker health check reporting healthy, langgraph absent, running as a non-root user, and `ingest.py` run from the image). Nothing has been deployed to AWS.
+```bash
+deploy/deploy_lambda.sh
+```
+
+Docker Desktop's default image format (an OCI index with provenance attestations) is rejected by Lambda with *"image manifest, config or layer media type ... is not supported"*. The script builds with `--provenance=false --sbom=false` and `oci-mediatypes=false`.
+
+**Still to do:**
+- **The chat widget** on neonomad.co.uk that calls `/ask`, including a line telling customers they're talking to an automated assistant.
+- **A spend limit in the Anthropic console**, as a backstop beyond the daily cap.
+- Optionally, a custom domain (`api.neonomad.co.uk`) via CloudFront and a free ACM certificate; the Function URL works without it.
+
+**Tested:** locally, the rate limiter against Postgres (each limit, hashing, cleanup, RLS) and the image on a read-only filesystem (ingestion, `/ready`, `/health`, `/docs` hidden, an answer, a 429). Live: `/health` (88 chunks from Supabase), the motorhome question answered correctly with DVLA and BikerBed citations, the rate limiter recording the request as a hashed IP, CORS allowing neonomad.co.uk and refusing other origins, and cold starts measured at 2048 and 3008 MB.
 
 ## Known gaps in the knowledge base
 
@@ -537,10 +543,11 @@ eval/
   report.html        per-case report (each row links to its transcript)
   _checks/           pilot runs and grader sanity checks (not part of results)
 app.py               FastAPI service over query.py: POST /ask, GET /health (the production entry point)
-ratelimit.py         in-memory rate limits for /ask: per IP per minute/day, plus a daily cap on all questions
-Dockerfile           production image: app.py + query.py + ingest.py + docs/md, embedding model baked in
+ratelimit.py         rate limits for /ask in Postgres: per IP per minute/day, plus a daily cap on all questions
+Dockerfile           production image (Lambda or any container): app.py + query.py + ingest.py + docs/md, model baked in
 deploy/
-  ecs-task-definition.json  Fargate task definition template (placeholders in <ANGLE_BRACKETS>)
+  deploy_lambda.sh   build the Lambda-compatible image, push to ECR, update the function
+  ecs-task-definition.json  Fargate task definition template, if it ever moves to ECS (placeholders in <ANGLE_BRACKETS>)
 docker-compose.yml   Postgres 17 + pgvector (local development)
 requirements.txt     production dependencies
 requirements-agent.txt  adds langgraph for agent.py (not installed in production)

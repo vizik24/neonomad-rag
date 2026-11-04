@@ -155,12 +155,16 @@ CREATE TABLE chunks (
 CREATE INDEX chunks_embedding_idx ON chunks USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX chunks_tsv_idx ON chunks USING gin (tsv);
 CREATE INDEX chunks_doc_type_idx ON chunks (doc_type);
+
+-- On Supabase, public tables are reachable through its REST API; RLS with no policies blocks that.
+-- The app connects as the table owner, which RLS doesn't apply to.
+ALTER TABLE chunks ENABLE ROW LEVEL SECURITY;
 """
 
 
 def store_chunks(chunks: list[Chunk], embeddings, database_url: str = DATABASE_URL) -> None:
     """Rebuild the chunks table and insert every chunk with its embedding."""
-    with psycopg.connect(database_url) as conn:
+    with psycopg.connect(database_url, prepare_threshold=None) as conn:  # works through Supabase's pooler
         conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
         register_vector(conn)
         conn.execute(SCHEMA)

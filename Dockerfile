@@ -1,6 +1,15 @@
-# Production image: the FastAPI service (app.py) over query.py, plus ingest.py for one-off ingestion tasks.
+# Production image: the FastAPI service (app.py) over query.py, plus ingest.py for one-off ingestion.
+# Runs unchanged on AWS Lambda (via the Lambda Web Adapter below) or as a plain container (ECS, docker run).
 # The self-check agent (agent.py, langgraph) is deliberately left out: see README, "Deployment".
 FROM python:3.11-slim
+
+# Lambda Web Adapter: a Lambda extension that turns invocations into HTTP requests to uvicorn, so the same
+# FastAPI app serves Lambda. Outside Lambda it does nothing.
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.9.1 /lambda-adapter /opt/extensions/lambda-adapter
+# The adapter waits for this path before sending traffic. /ready, not /health: /health returns 503 until the
+# database is ingested, which would stop the function ever starting.
+ENV AWS_LWA_PORT=8000 \
+    AWS_LWA_READINESS_CHECK_PATH=/ready
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
